@@ -31,7 +31,7 @@ Named entities (type, text, score) are extracted with a token-classification mod
 | File | Required columns |
 |---|---|
 | `records.csv` | `record_id`, `name`, `hierarchy_code`, `function`, `description`, `details`, `tags` (a field can be left empty; the text is built from the columns listed in `INPUT_COLUMNS`) |
-| `eligible_ids.csv` | `record_id` |
+| `eligible_ids.csv` | `record_id` (only these records are classified) |
 
 ## Output
 
