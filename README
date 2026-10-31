@@ -1,0 +1,83 @@
+# Hybrid Record Classifier
+
+A configurable text-classification pipeline that assigns records to a user-defined taxonomy. It combines transparent rule-based matching (names, phrases, keywords, hierarchical codes) with a zero-shot language-model fallback, and also extracts named entities from each record. Every prediction comes with a confidence score that reflects which stage made the decision.
+
+## How it works
+
+For each record the classifier tries the following stages in order and stops at the first match:
+
+| Stage | Evidence | Confidence |
+|---|---|---|
+| 1 | Taxonomy match in the record **name** | highest |
+| 2 | Taxonomy match in the **description** (explicit class phrase, then first sentence) | high |
+| 3 | Structured **code** lookup (optional metadata rule) | high |
+| 4 | **Zero-shot classification** (NLI model) over the combined text | model score |
+
+The combined text used by the model stages is built from the record fields, led by any "*name* is a/an ..." sentences and the code association, so the strongest evidence appears first.
+
+Named entities (type, text, score) are extracted with a token-classification model and kept when the score is at least `MIN_NER_CONFIDENCE`.
+
+## Repository structure
+
+```
+.
+├── classifier.py       # pipeline and configuration
+├── requirements.txt
+└── README.md
+```
+
+## Input data
+
+| File | Required columns |
+|---|---|
+| `records.csv` | `record_id`, `name`, `hierarchy_code`, `function`, `description`, `details`, `tags` (a field can be left empty; the text is built from the columns listed in `INPUT_COLUMNS`) |
+| `eligible_ids.csv` | `record_id` |
+
+## Output
+
+`classification_results.csv`: all input columns plus
+
+- `predicted_class`: the assigned class,
+- `confidence`: the confidence of the stage that decided,
+- `entities`: extracted entities, stored as a string.
+
+## Configuration
+
+All settings are in the `CONFIG` section of `classifier.py`:
+
+- `CLASS_KEYWORDS`: the taxonomy, as class label -> keywords. `CANDIDATE_LABELS` for the zero-shot stage is derived from it.
+- `CODE_ASSOCIATIONS` and `CODE_PREFIX_LEN`: optional rule mapping code prefixes to classes.
+- `PROTECTED_CLASSES`: classes whose first-sentence matches are only accepted when the keyword is also in the name or the sentence reads "... is *keyword*". Use it for classes with ambiguous keywords.
+- `NER_MODEL_NAME` and `ZSC_MODEL_NAME`: any Hugging Face token-classification and zero-shot-classification models.
+- `MIN_NER_CONFIDENCE` and the per-stage confidence values.
+
+## Adapting to your case
+
+`classifier.py` is a template and a guide, not a ready-to-run solution. Placeholders are marked `ADAPT` in the code. For each use case:
+
+- insert the proper input data and column names,
+- define the taxonomy (`Class A-C` and the keywords are placeholders),
+- add, remove or reorder the rules in `infer_class` to suit the data (for example, drop the code rule if there is no code field).
+
+## Getting started
+
+```bash
+git clone <repo-url>
+cd <repo-folder>
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python classifier.py
+```
+
+Models are downloaded from the Hugging Face Hub on first run.
+
+## Notes
+
+- Rule-based stages run before the models, so most records never reach the zero-shot stage, which keeps runs fast and results explainable.
+- Stage order encodes reliability. Reorder or remove stages in `infer_class` to suit your data.
+- Records with no usable text and no rule match get an empty class.
+
+## License
+
+MIT (see `LICENSE`).
