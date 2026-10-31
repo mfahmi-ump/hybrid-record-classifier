@@ -1,0 +1,210 @@
+"""
+Hybrid rule-based + zero-shot text classifier (TEMPLATE / GUIDE).
+
+Assigns each record to one class from a user-defined taxonomy by trying, in
+order of reliability:
+  1. taxonomy match in the record name
+  2. taxonomy match in the description (explicit class phrase, then first sentence)
+  3. structured-code lookup (optional metadata rule)
+  4. zero-shot classification (NLI model) on the combined text
+Named entities are also extracted from the combined text with an NER model.
+
+NOTE: this file is a guide, not a ready-to-run solution. Placeholders are
+marked "ADAPT". For each use case: insert the proper input data, define the
+taxonomy, and add or remove rules that suit the data (see infer_class).
+"""
+import re
+import pandas as pd
+from transformers import pipeline
+
+# =========================
+# CONFIG
+# =========================
+
+# ADAPT: point these to your own input data and match the column names to it.
+RECORDS_CSV = "records.csv"            # required column: record_id (+ INPUT_COLUMNS)
+ELIGIBLE_CSV = "eligible_ids.csv"      # required column: record_id (rows kept for classification)
+OUTPUT_CSV = "classification_results.csv"
+
+ID_COLUMN = "record_id"
+NAME_COLUMN = "name"
+DESCRIPTION_COLUMN = "description"
+CODE_COLUMN = "hierarchy_code"         # optional hierarchical code(s), separated by ; , | / or space
+INPUT_COLUMNS = ["name", "hierarchy_code", "function", "description", "details", "tags"]
+
+NER_MODEL_NAME = "dslim/bert-base-NER"          # any token-classification model
+ZSC_MODEL_NAME = "facebook/bart-large-mnli"     # any zero-shot-classification model
+MIN_NER_CONFIDENCE = 0.50
+
+# ADAPT: taxonomy, as class label -> lowercase keywords that indicate it.
+# Insert the classes and keywords that apply to your case.
+CLASS_KEYWORDS = {
+    "Class A": ["keyword a1", "keyword a2"],
+    "Class B": ["keyword b1"],
+    "Class C": ["keyword c1", "keyword c2"],
+}
+CANDIDATE_LABELS = list(CLASS_KEYWORDS)
+
+# ADAPT (optional rule): structured code prefix -> class label.
+# Insert your own coding scheme and prefix length, or delete this rule
+# (and its stage in infer_class) if your data has no such field.
+CODE_PREFIX_LEN = 6
+CODE_ASSOCIATIONS = {
+    "CODE_A": "Class A",
+    "CODE_B": "Class B",
+    "CODE_C": "Class C",
+}
+
+# ADAPT: classes whose first-sentence keyword match is only trusted if the keyword is
+# also in the record name, or the sentence reads "... is <keyword>".
+PROTECTED_CLASSES = {"Class A"}
+
+# Confidence assigned to each rule-based stage (zero-shot returns its own score).
+CONF_NAME, CONF_PHRASE, CONF_FIRST_SENTENCE, CONF_CODE = 1.0, 0.98, 0.97, 0.95
+
+# =========================
+# TEXT HELPERS
+# =========================
+
+def build_text(row):
+    return " ".join(str(row[c]) for c in INPUT_COLUMNS if c in row and pd.notna(row[c]))
+
+def emphasize_class_sentences(name, description):
+    """Pull out '<name> is a/an ...' sentences so they lead the text."""
+    if pd.isna(description):
+        return ""
+    pattern = rf"{re.escape(name)} is (a|an) ([^.]+)"
+    matches = re.findall(pattern, description, re.IGNORECASE)
+    return " ".join(f"{name} is {m[1].strip()}." for m in matches) + " " if matches else ""
+
+def first_sentence(text):
+    return "" if pd.isna(text) else text.split(".")[0].lower()
+
+# =========================
+# CODE LOOKUP
+# =========================
+
+def _prefixes(code):
+    if pd.isna(code):
+        return []
+    return [c.strip()[:CODE_PREFIX_LEN] for c in re.split(r"[;,|/ ]+", str(code)) if c.strip()]
+
+def code_pick_class(code):
+    for prefix in _prefixes(code):
+        if prefix in CODE_ASSOCIATIONS:
+            return CODE_ASSOCIATIONS[prefix]
+    return None
+
+def code_association_line(code):
+    lines = [f"[{p}, {CODE_ASSOCIATIONS[p]}]" for p in _prefixes(code) if p in CODE_ASSOCIATIONS]
+    return f"Code association: {', '.join(lines)}. " if lines else ""
+
+# =========================
+# RULE-BASED STAGES
+# =========================
+
+def class_from_name(name):
+    name_lower = name.lower()
+    for cls, keywords in CLASS_KEYWORDS.items():
+        if any(kw in name_lower for kw in keywords):
+            return cls
+    return None
+
+def class_from_class_phrase(description):
+    """Detect 'belongs to / member of / part of the X class' and 'class of Xs'."""
+    if pd.isna(description):
+        return None
+    patterns = [
+        r"belongs to the ([a-z0-9\- ]+?) class",
+        r"member of the ([a-z0-9\- ]+?) class",
+        r"part of the ([a-z0-9\- ]+?) class",
+        r"class of ([a-z0-9\- ]+?)s",
+    ]
+    desc = description.lower()
+    for pattern in patterns:
+        for match in re.findall(pattern, desc):
+            phrase = match.strip()
+            for cls, keywords in CLASS_KEYWORDS.items():
+                if any(kw in phrase for kw in keywords):
+                    return cls
+    return None
+
+def class_from_first_sentence(description, name):
+    sent = first_sentence(description)
+    for cls, keywords in CLASS_KEYWORDS.items():
+        for kw in keywords:
+            if kw in sent:
+                if cls in PROTECTED_CLASSES and not (kw in name.lower() or f" is {kw}" in sent):
+                    continue
+                return cls
+    return None
+
+# =========================
+# MODELS
+# =========================
+
+def load_models():
+    ner = pipeline(task="ner", model=NER_MODEL_NAME, aggregation_strategy="simple")
+    zsc = pipeline(task="zero-shot-classification", model=ZSC_MODEL_NAME)
+    return ner, zsc
+
+def extract_entities(ner, text):
+    if not text.strip():
+        return []
+    return [
+        {"type": e["entity_group"], "text": e["word"].lower(), "score": float(e.get("score", 1.0))}
+        for e in ner(text)
+        if e.get("score", 1.0) >= MIN_NER_CONFIDENCE
+    ]
+
+# =========================
+# CLASS INFERENCE
+# =========================
+
+def infer_class(zsc, text, name, description, code):
+    # ADAPT: add, remove or reorder rules to suit the case. Keep the most
+    # reliable evidence first and the zero-shot model as the last resort.
+    for cls, conf in (
+        (class_from_name(name), CONF_NAME),
+        (class_from_class_phrase(description), CONF_PHRASE),
+        (class_from_first_sentence(description, name), CONF_FIRST_SENTENCE),
+        (code_pick_class(code), CONF_CODE),
+    ):
+        if cls:
+            return cls, conf
+    if not text.strip():
+        return None, None
+    result = zsc(text, candidate_labels=CANDIDATE_LABELS, multi_label=False)
+    return result["labels"][0], result["scores"][0]
+
+# =========================
+# PIPELINE
+# =========================
+
+def main():
+    records = pd.read_csv(RECORDS_CSV)
+    eligible = pd.read_csv(ELIGIBLE_CSV)
+    records = records[records[ID_COLUMN].isin(eligible[ID_COLUMN])].reset_index(drop=True)
+
+    ner, zsc = load_models()
+    results = {}
+    for _, row in records.iterrows():
+        name, description, code = row[NAME_COLUMN], row[DESCRIPTION_COLUMN], row[CODE_COLUMN]
+        text = (emphasize_class_sentences(name, description)
+                + code_association_line(code)
+                + name + ". " + build_text(row))
+        label, confidence = infer_class(zsc, text, name, description, code)
+        results[row[ID_COLUMN]] = {
+            "predicted_class": label,
+            "confidence": confidence,
+            "entities": extract_entities(ner, text),
+        }
+
+    out = records.copy()
+    out["predicted_class"] = out[ID_COLUMN].map(lambda x: results[x]["predicted_class"])
+    out["confidence"] = out[ID_COLUMN].map(lambda x: results[x]["confidence"])
+    out["entities"] = out[ID_COLUMN].map(lambda x: str(results[x]["entities"]))
+    out.to_csv(OUTPUT_CSV, index=False)
+
+if __name__ == "__main__":
+    main()
